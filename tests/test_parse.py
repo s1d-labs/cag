@@ -1,20 +1,19 @@
-"""Parsing tests on a saved page: fast, no network. Add a saved page for every layout your site has."""
 from pathlib import Path
 
-import crawl
+from parse import list_page, list_url, pdf_key, report_page
 
 PAGES = Path(__file__).parent / "pages"
 
 
-def test_catalogue_page_gives_twenty_books():
-    rows = crawl.parse((PAGES / "catalogue-page-1.html").read_text(encoding="utf-8"))
-    assert len(rows) == 20
-    rid, book = rows[0]
-    assert rid == "a-light-in-the-attic_1000"                       # the site's own id: stable across runs
-    assert book["title"] == "A Light in the Attic" and book["price"] == "£51.77" and book["availability"] == "In stock"
-    assert book["url"].startswith("https://books.toscrape.com/catalogue/")
-    assert len({r for r, _ in rows}) == 20                          # no duplicate ids on a page
+def test_list():
+    found, last = list_page((PAGES / "list.html").read_text(errors="replace"))
+    assert found and found[0]["id"].isdigit() and found[0]["title"] and last >= 1
 
 
-def test_an_empty_page_gives_nothing():
-    assert crawl.parse("<html><body>No products</body></html>") == []
+def test_report():
+    pdfs, _ = report_page((PAGES / "report.html").read_text(errors="replace"))
+    assert pdfs and all(u.startswith("https://") for u in pdfs)
+
+
+def test_small():
+    assert "gt=49&page=2" in list_url(49, 2) and pdf_key("a").startswith("pdf-")

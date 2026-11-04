@@ -1,6 +1,6 @@
 {
   "family": "cag",
-  "about": "CAG of India: all audit reports and their PDFs",
+  "about": "CAG of India: every audit report page and its PDFs (state, Union, local bodies)",
   "setup": [
     "pip install -r requirements.txt"
   ],

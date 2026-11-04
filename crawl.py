@@ -1,68 +1,31 @@
-"""The family's `crawl` task (see scrape.json). Try it without the hub: python crawl.py --local [url] The pool worker runs it with the assignment's env and:
-SCRAPE_POOL_PROJECT (which project), SCRAPE_JOB_INDEX / SCRAPE_TOTAL_JOBS (this worker's slice), SCRAPE_MAX_HOURS (time budget).
-
-It claims queue items from the hub, fetches each page politely (threads and delay come from the hub on every call), keeps the
-raw page in the family's bucket (the hub signs the upload; this code never holds a storage key), stores one record per book,
-and reports the standard counters (n_http, t_http_s, http_error, http_<code>) the hub uses for politeness and tracking.
-"""
-import gzip
-import html
-import json
+"""One queue item: a list page, a report page or a PDF."""
+import hashlib
 import os
-import re
+import signal
 import sys
 import time
+from urllib.parse import quote
 
 import requests
+from scrape_hub_client import HubClient, seed_queue
 
-PROJECT = os.environ.get("SCRAPE_POOL_PROJECT", "")
-SITE = os.environ.get("SITE", "https://books.toscrape.com")
+from parse import list_page, list_url, pdf_key, report_page
+
+PROJECT = os.environ["SCRAPE_POOL_PROJECT"]
 DEADLINE = time.time() + float(os.environ.get("SCRAPE_MAX_HOURS", "1")) * 3600 - 120
-UA = "s1d-labs scraper (https://github.com/s1d-labs)"
-BOOK = re.compile(r'<article class="product_pod">.*?<a href="([^"]+)" title="([^"]+)".*?<p class="price_color">([^<]+)</p>.*?'
-                  r'<p class="instock availability">\s*(?:<i[^>]*></i>)?\s*([^<]+?)\s*</p>', re.S)
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; s1d-labs public records crawl; +https://labs.s1d.me)"}
+stop = False
 
 
-def parse(page):
-    """[(record_id, data)] for the books on one catalogue page. Pure: test it on saved pages."""
-    out = []
-    for href, title, price, stock in BOOK.findall(page):
-        slug = href.rsplit("/", 2)[-2]
-        out.append((slug, {"title": html.unescape(title), "price": price.strip(), "availability": stock.strip(),
-                           "url": SITE + "/catalogue/" + href.lstrip("./")}))
-    return out
+def on_signal(*_):
+    global stop
+    stop = True
 
 
-class LocalHub:
-    """Stand-in for HubClient so `--local` runs without the hub: counters go to stderr, records to stdout."""
-    settings = {"threads": 1, "delay_ms": 0, "paused": False}
-
-    def __init__(self):
-        self.counts = {}
-
-    def metric(self, name, value=1):
-        self.counts[name] = self.counts.get(name, 0) + value
-
-    def error(self, n=1):
-        self.metric("errors", n)
-
-    def block(self, n=1):
-        self.metric("blocked", n)
-
-
-def local(url):
-    hub = LocalHub()
-    page = fetch(hub, requests.Session(), url)
-    rows = parse(page) if page else []
-    for rid, data in rows:
-        print(json.dumps({"record_id": rid, "data": data}, ensure_ascii=False))
-    print(f"{len(rows)} records, counters {hub.counts}", file=sys.stderr)
-
-
-def fetch(hub, session, url):
+def get(hub, s, url):
     t = time.time()
     try:
-        r = session.get(url, timeout=30, headers={"User-Agent": UA})
+        r = s.get(url, timeout=(20, 300))
     except requests.RequestException:
         hub.metric("http_error")
         hub.error()
@@ -74,42 +37,62 @@ def fetch(hub, session, url):
         if r.status_code in (403, 429, 503):
             hub.block()
         return None
-    if not r.encoding or r.encoding.lower() == "iso-8859-1":     # no charset declared: requests guesses Latin-1; trust the content
-        r.encoding = r.apparent_encoding or "utf-8"
-    return r.text
+    return r
+
+
+def work(hub, s, key, p):
+    if p["type"] == "list":
+        r = get(hub, s, list_url(p["gt"], p["page"]))
+        if r is None:
+            return None
+        found, last = list_page(r.text)
+        if p["page"] == 1 and last > 1:
+            seed_queue(PROJECT, [{"key": f"list-{p['group']}-{n}", "payload": {**p, "page": n}} for n in range(2, last + 1)])
+        for x in found:
+            hub.record(f"report-{x['id']}", {"type": "report", "group": p["group"], **x})       # the report page replaces this with the full record
+        seed_queue(PROJECT, [{"key": f"report-{x['id']}", "payload": {"type": "report", "group": p["group"], **x}} for x in found])
+        return len(found)
+    if p["type"] == "report":
+        r = get(hub, s, f"https://cag.gov.in/en/audit-report/details/{p['id']}")
+        if r is None:
+            return None
+        pdfs, tabled = report_page(r.text)
+        hub.record(f"report-{p['id']}", {"type": "report", "id": p["id"], "group": p["group"], "title": p["title"], "blurb": p["blurb"], "sector": p["sector"], "tabled": tabled, "pdfs": [{"url": u, "label": l} for u, l in pdfs.items()]})
+        if pdfs:
+            seed_queue(PROJECT, [{"key": pdf_key(u), "payload": {"type": "pdf", "report": p["id"], "url": u, "label": l}} for u, l in pdfs.items()])
+        return 1
+    r = get(hub, s, quote(p["url"], safe=":/%?=&+"))
+    if r is None or not r.content.startswith(b"%PDF"):
+        return None
+    sha = hashlib.sha256(r.content).hexdigest()
+    path = f"pdf/{p['report']}/{sha[:16]}.pdf"
+    hub.upload_many([(path, r.content, "application/pdf")])
+    hub.record(key, {"type": "pdf", "report": p["report"], "url": p["url"], "label": p["label"], "file": path, "bytes": len(r.content), "sha256": sha})
+    return 1
 
 
 def main():
-    from scrape_hub_client import HubClient      # imported here so --local works without it
-    hub = HubClient(PROJECT, job_index=int(os.environ.get("SCRAPE_JOB_INDEX", "0")), total_jobs=int(os.environ.get("SCRAPE_TOTAL_JOBS", "1")))
-    session = requests.Session()
-    try:
-        while time.time() < DEADLINE:
-            if hub.settings.get("paused"):
-                time.sleep(30)                          # the hub holds us (site down, or the family owner paused it)
-                continue
-            items = hub.claim(1, steal=True, retry_failed=True)
-            if not items:
-                break                                   # nothing left for this project: exit, the worker asks the hub for more
-            item = items[0]
-            page = fetch(hub, session, item["payload"]["url"])
-            if page is None:
-                hub.complete([item["key"]], "failed", error="page did not load")
-                continue
-            hub.upload_many([(f"pages/{item['key']}.html.gz", gzip.compress(page.encode()), "application/gzip")])
-            rows = parse(page)
-            for rid, data in rows:
-                hub.record(rid, {**data, "page": item["key"]})
-            hub.complete([item["key"]], "done", fetched=len(rows))
-            time.sleep(max(0.5, hub.settings.get("delay_ms", 0) / 1000))
-        hub.close()
-    except BaseException as e:
-        hub.close("failed", f"{type(e).__name__}: {e}"[:200])
-        raise
+    hub = HubClient(PROJECT, job_index=int(os.environ.get("SCRAPE_JOB_INDEX", 0)), total_jobs=int(os.environ.get("SCRAPE_TOTAL_JOBS", 1)))
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    while time.time() < DEADLINE and not stop:
+        if hub.settings.get("paused"):
+            time.sleep(30)
+            continue
+        items = hub.claim(1, steal=True, retry_failed=True)
+        if not items:
+            break
+        it = items[0]
+        n = work(hub, s, it["key"], it["payload"])
+        if n is None:
+            hub.complete([it["key"]], "failed", error="no page")
+        else:
+            hub.complete([it["key"]], "done", fetched=n)
+        time.sleep(max(1, hub.settings.get("delay_ms", 0) / 1000))
+    hub.close("finished" if not stop else "failed", "" if not stop else "stopped by signal")
 
 
 if __name__ == "__main__":
-    if sys.argv[1:2] == ["--local"]:
-        local(sys.argv[2] if len(sys.argv) > 2 else SITE + "/catalogue/page-1.html")
-    else:
-        main()
+    sys.exit(main())
