@@ -1,43 +1,24 @@
 """One queue item: a list page, a report page or a PDF."""
 import hashlib
 import os
-import signal
 import sys
 import time
 from urllib.parse import quote
 
 import requests
-from scrape_hub_client import HubClient, seed_queue
+from scrape_hub_client import HubClient, seed_queue, stop_flag, timed_get
 
 from parse import list_page, list_url, pdf_key, report_page
 
 PROJECT = os.environ["SCRAPE_POOL_PROJECT"]
 DEADLINE = time.time() + float(os.environ.get("SCRAPE_MAX_HOURS", "1")) * 3600 - 120
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; s1d-labs public records crawl; +https://labs.s1d.me)"}
-stop = False
-
-
-def on_signal(*_):
-    global stop
-    stop = True
+stop = stop_flag(install=False)     # set on SIGINT / SIGTERM once main() installs the handlers
 
 
 def get(hub, s, url):
-    t = time.time()
-    try:
-        r = s.get(url, timeout=(20, 300))
-    except requests.RequestException:
-        hub.metric("http_error")
-        hub.error()
-        return None
-    hub.metric("n_http")
-    hub.metric("t_http_s", time.time() - t)
-    if r.status_code != 200:
-        hub.metric(f"http_{r.status_code}")
-        if r.status_code in (403, 429, 503):
-            hub.block()
-        return None
-    return r
+    r = timed_get(hub, s, url, timeout=(20, 300))      # counts n_http, t_http_s, http_<code>, http_error for the hub
+    return r if r is not None and r.status_code == 200 else None
 
 
 def work(hub, s, key, p):
@@ -73,11 +54,10 @@ def work(hub, s, key, p):
 
 def main():
     hub = HubClient(PROJECT, job_index=int(os.environ.get("SCRAPE_JOB_INDEX", 0)), total_jobs=int(os.environ.get("SCRAPE_TOTAL_JOBS", 1)))
-    signal.signal(signal.SIGINT, on_signal)
-    signal.signal(signal.SIGTERM, on_signal)
+    stop_flag()
     s = requests.Session()
     s.headers.update(HEADERS)
-    while time.time() < DEADLINE and not stop:
+    while time.time() < DEADLINE and not stop.is_set():
         if hub.settings.get("paused"):
             time.sleep(30)
             continue
@@ -91,7 +71,7 @@ def main():
         else:
             hub.complete([it["key"]], "done", fetched=n)
         time.sleep(max(1, hub.settings.get("delay_ms", 0) / 1000))
-    hub.close("finished" if not stop else "failed", "" if not stop else "stopped by signal")
+    hub.close("finished" if not stop.is_set() else "failed", "" if not stop.is_set() else "stopped by signal")
 
 
 if __name__ == "__main__":
